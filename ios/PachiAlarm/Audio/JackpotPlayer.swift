@@ -27,19 +27,60 @@ final class JackpotPlayer: NSObject, AVAudioPlayerDelegate {
             // アラーム音のオーディオが終わるのを少し待つ
             try? await Task.sleep(nanoseconds: UInt64(s.bgmDelayMs) * 1_000_000)
         }
-        return play(settings: s, reason: "停止Intent id=\(alarmID.prefix(8))")
+        // 停止直後はAlarmKit側の音が残っている可能性があるので、500msおきに最大12回(約6秒)やり直す。
+        // 各回の結果と、他のオーディオの状態をログに残す。
+        let maxAttempts = 12
+        for attempt in 1...maxAttempts {
+            if tryActivateOnce(mode: s.audioMode, attempt: attempt) {
+                return play(settings: s,
+                            reason: "停止Intent id=\(alarmID.prefix(8)) 試行\(attempt)回目",
+                            alreadyActive: true)
+            }
+            if attempt < maxAttempts {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        DebugLog.shared.log("AUDIO", "\(maxAttempts)回試してもセッションを開始できませんでした")
+        return false
+    }
+
+    /// セッション開始を1回試す(停止Intentからのやり直し用)。失敗理由をコード名つきでログに残す。
+    private func tryActivateOnce(mode: AudioSessionMode, attempt: Int) -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        DebugLog.shared.log("AUDIO", "試行\(attempt): 他の音が再生中=\(session.isOtherAudioPlaying) "
+            + "他の音を静かにすべき=\(session.secondaryAudioShouldBeSilencedHint) 出力=\(routeText())")
+        installObserversIfNeeded()
+        let attempts: [(String, AVAudioSession.CategoryOptions)]
+        switch mode {
+        case .exclusive: attempts = [("通常", [])]
+        case .mix: attempts = [("ミックス", [.mixWithOthers])]
+        case .auto: attempts = [("通常", []), ("ミックス", [.mixWithOthers])]
+        }
+        for (label, options) in attempts {
+            do {
+                try session.setCategory(.playback, mode: .default, options: options)
+                try session.setActive(true)
+                DebugLog.shared.log("AUDIO", "試行\(attempt): セッション開始OK(\(label))")
+                return true
+            } catch {
+                DebugLog.shared.log("AUDIO", "試行\(attempt): 失敗(\(label)): \(describe(error))")
+            }
+        }
+        return false
     }
 
     /// 再生(手動テストからも呼ぶ)。二重再生を防ぐため、再生中なら先に止める。
     @discardableResult
-    func play(settings s: AppSettings, reason: String) -> Bool {
+    func play(settings s: AppSettings, reason: String, alreadyActive: Bool = false) -> Bool {
         guard let url = SoundLibrary.resolveBGM(s.selectedBGM) else {
             DebugLog.shared.log("BGM", "再生するファイルがありません")
             return false
         }
         if player != nil { stop(reason: "二重再生防止") }
         installObserversIfNeeded()
-        guard activateSession(mode: s.audioMode) else { return false }
+        if !alreadyActive {
+            guard activateSession(mode: s.audioMode) else { return false }
+        }
 
         do {
             let p = try AVAudioPlayer(contentsOf: url)
@@ -158,6 +199,13 @@ final class JackpotPlayer: NSObject, AVAudioPlayerDelegate {
 
     private func describe(_ error: Error) -> String {
         let ns = error as NSError
-        return "\(ns.domain) code=\(ns.code) \(ns.localizedDescription)"
+        let name: String
+        switch ns.code {
+        case 560557684: name = "CannotInterruptOthers(他の音を止められない)"
+        case 561015905: name = "CannotStartPlaying(今は再生を始められない)"
+        case 561017449: name = "InsufficientPriority(優先度が足りない)"
+        default: name = "-"
+        }
+        return "\(ns.domain) code=\(ns.code) [\(name)] \(ns.localizedDescription)"
     }
 }
