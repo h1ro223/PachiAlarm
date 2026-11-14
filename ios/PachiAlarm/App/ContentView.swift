@@ -10,6 +10,9 @@ final class BGMSettingsModel: ObservableObject {
     @Published var volume: Float { didSet { SettingsStore.update { [volume] in $0.bgmVolume = volume } } }
     @Published var delayMs: Int { didSet { SettingsStore.update { [delayMs] in $0.bgmDelayMs = delayMs } } }
     @Published var mode: AudioSessionMode { didSet { SettingsStore.update { [mode] in $0.audioMode = mode } } }
+    @Published var autoPlayOnOpen: Bool { didSet { SettingsStore.update { [autoPlayOnOpen] in $0.autoPlayOnOpen = autoPlayOnOpen } } }
+    @Published var fanfareMode: FanfareMode { didSet { SettingsStore.update { [fanfareMode] in $0.fanfareMode = fanfareMode } } }
+    @Published var fanfareSound: String { didSet { SettingsStore.update { [fanfareSound] in $0.fanfareSound = fanfareSound } } }
 
     init() {
         let s = SettingsStore.load()
@@ -18,10 +21,35 @@ final class BGMSettingsModel: ObservableObject {
         volume = s.bgmVolume
         delayMs = s.bgmDelayMs
         mode = s.audioMode
+        autoPlayOnOpen = s.autoPlayOnOpen
+        fanfareMode = s.fanfareMode
+        fanfareSound = s.fanfareSound
     }
 }
 
 private enum ImportTarget { case alarmSound, bgm }
+
+/// 「5秒後」などの短縮テスト。選ぶと下の「時刻」より優先される。
+private enum ShortTest: String, CaseIterable, Identifiable {
+    case none, s5, s10, s30
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .none: return "使わない"
+        case .s5: return "5秒後"
+        case .s10: return "10秒後"
+        case .s30: return "30秒後"
+        }
+    }
+    var seconds: TimeInterval? {
+        switch self {
+        case .none: return nil
+        case .s5: return 5
+        case .s10: return 10
+        case .s30: return 30
+        }
+    }
+}
 
 private enum TimeChoice: String, CaseIterable, Identifiable {
     case m1, m2, m5, custom
@@ -57,6 +85,10 @@ struct ContentView: View {
     @State private var soundChoice: SoundChoice = .systemDefault
     @State private var secondary: SecondaryChoice = .snooze
     @State private var snoozeSeconds = 60
+    @State private var stopMode: StopMode = .normal
+    @State private var shortTest: ShortTest = .none
+    @State private var useCountdown = false
+    @State private var notifText = "-"
 
     // 音声一覧
     @State private var bundled: [SoundItem] = []
@@ -83,6 +115,7 @@ struct ContentView: View {
                 alarmListSection
                 alarmSoundSection
                 bgmSection
+                fanfareSection
                 logSection
                 creditSection
             }
@@ -95,12 +128,16 @@ struct ContentView: View {
                       allowsMultipleSelection: false) { result in
             handleImport(result)
         }
-        .onAppear { refreshAll() }
+        .onAppear {
+            refreshAll()
+            playPendingBGMIfNeeded(source: "起動直後")
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 DebugLog.shared.log("APP", "前面に表示")
                 refreshAll()
                 checkOpenedFromAlarm()
+                playPendingBGMIfNeeded(source: "前面になった時")
             }
         }
     }
@@ -125,6 +162,13 @@ struct ContentView: View {
     private var createSection: some View {
         Section {
             TextField("タイトル", text: $title)
+            Picker("短縮テスト(秒単位)", selection: $shortTest) {
+                ForEach(ShortTest.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            if shortTest != .none {
+                Toggle("カウントダウン(タイマー)方式で鳴らす", isOn: $useCountdown)
+            }
             Picker("時刻", selection: $timeChoice) {
                 ForEach(TimeChoice.allCases) { Text($0.label).tag($0) }
             }
@@ -142,6 +186,9 @@ struct ContentView: View {
                     Text("[取込] \(item.name) \(item.durationText)").tag(SoundChoice.named(item.name))
                 }
             }
+            Picker("停止ボタンの動作", selection: $stopMode) {
+                ForEach(StopMode.allCases) { Text($0.label).tag($0) }
+            }
             Picker("副ボタン", selection: $secondary) {
                 ForEach(SecondaryChoice.allCases) { Text($0.label).tag($0) }
             }
@@ -158,7 +205,7 @@ struct ContentView: View {
         } header: {
             Text("テストアラーム作成")
         } footer: {
-            Text("登録したら画面をロックして待ってください。停止ボタンを押すと大当たりBGMが鳴るかを検証します。")
+            Text("登録したら画面をロックして待ってください。「短縮テスト」を選ぶと5〜30秒後に鳴ります(日時指定方式とカウントダウン方式の両方を試してください)。停止ボタンの動作を「アプリを開く」にすると、停止後にロック解除→アプリが前面→BGM自動再生を試せます。")
         }
     }
 
@@ -223,6 +270,7 @@ struct ContentView: View {
     private var bgmSection: some View {
         Section {
             Toggle("停止後に大当たりBGMを鳴らす", isOn: $bgm.enabled)
+            Toggle("アプリが前面になったらBGMを自動再生", isOn: $bgm.autoPlayOnOpen)
             Picker("BGM", selection: $bgm.selected) {
                 Text("[同梱] ダミーBGM 30秒").tag("")
                 ForEach(bgmFiles) { item in
@@ -264,6 +312,57 @@ struct ContentView: View {
             Text("大当たりBGM")
         } footer: {
             Text("端末のメディア音量はアプリから変更しません(Appleが許可していないため)。ログに現在のメディア音量を記録するので、アラーム音との差の調整に使ってください。")
+        }
+    }
+
+    // MARK: - ロック中のファンファーレ(30秒以内)
+
+    private var fanfareSection: some View {
+        Section {
+            Picker("停止時の方式", selection: $bgm.fanfareMode) {
+                ForEach(FanfareMode.allCases) { Text($0.label).tag($0) }
+            }
+            Picker("ファンファーレ音", selection: $bgm.fanfareSound) {
+                Text("[同梱] dummy_alarm_20s.caf").tag("")
+                ForEach(imported) { item in
+                    Text("[取込] \(item.name) \(item.durationText)").tag(item.name)
+                }
+            }
+            LabeledContent("通知の許可", value: notifText)
+            Button("通知を許可する") {
+                Task {
+                    await FanfarePlayer.requestNotificationAuthorization()
+                    notifText = await FanfarePlayer.authorizationText()
+                    logText = DebugLog.shared.readTail()
+                }
+            }
+            HStack {
+                Button("システムサウンドをテスト") {
+                    let s = SettingsStore.load()
+                    if let url = SoundLibrary.resolveFanfare(s.fanfareSound) {
+                        FanfarePlayer.playSystemSound(url: url)
+                    } else {
+                        DebugLog.shared.log("FANFARE", "ファンファーレ音が見つかりません")
+                    }
+                    logText = DebugLog.shared.readTail()
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                Button("通知を5秒後にテスト") {
+                    Task {
+                        let s = SettingsStore.load()
+                        if let url = SoundLibrary.resolveFanfare(s.fanfareSound) {
+                            await FanfarePlayer.postNotification(soundFileName: url.lastPathComponent, delay: 5)
+                        }
+                        logText = DebugLog.shared.readTail()
+                    }
+                }
+                .buttonStyle(.borderless)
+            }
+        } header: {
+            Text("ロック中のファンファーレ(30秒以内)")
+        } footer: {
+            Text("アプリ自身の再生はロック中に止められたため、システムサウンドと通知音を比べます。通知音はCAF(PCM)形式がおすすめです(取り込むと「_pcm.caf」ができます)。ロック中・マナーモード・集中モードでも試してください。")
         }
     }
 
@@ -316,6 +415,7 @@ struct ContentView: View {
     // MARK: - 処理
 
     private func refreshAll() {
+        Task { notifText = await FanfarePlayer.authorizationText() }
         alarms.refreshAuth()
         alarms.reload(source: "画面更新")
         bundled = SoundLibrary.bundledSounds()
@@ -340,21 +440,33 @@ struct ContentView: View {
         SettingsStore.update { $0.openFromAlarmAt = nil }
     }
 
+    /// 停止/「開く」から前面になった時に、BGMを自動で鳴らす(依頼があれば1回だけ)
+    private func playPendingBGMIfNeeded(source: String) {
+        guard SettingsStore.consumePendingBGM() else { return }
+        let ok = JackpotPlayer.shared.play(settings: SettingsStore.load(), reason: "前面で自動再生(\(source))")
+        DebugLog.shared.log("BGM", "前面で自動再生=\(ok)(\(source))")
+        logText = DebugLog.shared.readTail()
+    }
+
     private func createAlarm() async {
         busy = true
         defer { busy = false }
         let fireDate: Date
-        if let sec = timeChoice.seconds {
+        if let sec = shortTest.seconds {
+            fireDate = Date().addingTimeInterval(sec)
+        } else if let sec = timeChoice.seconds {
             fireDate = Date().addingTimeInterval(sec)
         } else {
             fireDate = nextOccurrence(of: customTime)
         }
         let req = TestAlarmRequest(title: title.isEmpty ? "押せ！" : title,
                                    fireDate: fireDate,
-                                   repeatsDaily: repeatsDaily,
+                                   repeatsDaily: repeatsDaily && shortTest == .none,
                                    sound: soundChoice,
                                    secondary: secondary,
-                                   snoozeSeconds: snoozeSeconds)
+                                   snoozeSeconds: snoozeSeconds,
+                                   stopMode: stopMode,
+                                   useCountdown: shortTest != .none && useCountdown)
         await alarms.schedule(req)
         logText = DebugLog.shared.readTail()
     }
