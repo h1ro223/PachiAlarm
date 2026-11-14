@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AlarmKit
 import ActivityKit
+import AppIntents
 
 /// AlarmKitに渡す追加情報(Phase 0では空)
 struct PachiMetadata: AlarmMetadata {}
