@@ -16,6 +16,24 @@ enum AudioSessionMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// 停止ボタンを押したとき、ロック中でも鳴らせるか試すファンファーレの方式(30秒以内の短い音用)
+enum FanfareMode: String, Codable, CaseIterable, Identifiable {
+    case off          // 鳴らさない
+    case systemSound  // AudioServices(システムサウンド)で鳴らす
+    case notification // ローカル通知の通知音で鳴らす
+    case both         // 両方(比べる用。二重に聞こえる)
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: return "なし"
+        case .systemSound: return "システムサウンド"
+        case .notification: return "通知音"
+        case .both: return "両方(二重になる)"
+        }
+    }
+}
+
 /// 登録したテストアラームの情報(AlarmKit側には持たせられないのでアプリで保存)
 struct AlarmMeta: Codable, Equatable {
     var title: String
@@ -38,12 +56,20 @@ struct AppSettings: Codable, Equatable {
     var lastJackpotAt: Date? = nil
     /// アラームの「開く」ボタンで起動した時刻(画面にバナーを出す)
     var openFromAlarmAt: Date? = nil
+    /// 停止/「開く」でアプリを前面に出したあと、BGMを自動で鳴らす
+    var autoPlayOnOpen: Bool = true
+    /// 「アプリが前面になったらBGMを鳴らす」依頼の時刻(鳴らしたら消す)
+    var pendingBGMAt: Date? = nil
+    /// ロック中の停止で試すファンファーレの方式と、使う音(同梱 or 取り込んだアラーム音の名前)
+    var fanfareMode: FanfareMode = .systemSound
+    var fanfareSound: String = ""
 
     init() {}
 
     enum CodingKeys: String, CodingKey {
         case bgmEnabled, selectedBGM, bgmVolume, bgmDelayMs, audioMode,
-             alarmMeta, lastJackpotAlarmID, lastJackpotAt, openFromAlarmAt
+             alarmMeta, lastJackpotAlarmID, lastJackpotAt, openFromAlarmAt,
+             autoPlayOnOpen, pendingBGMAt, fanfareMode, fanfareSound
     }
 
     init(from decoder: Decoder) throws {
@@ -58,6 +84,10 @@ struct AppSettings: Codable, Equatable {
         lastJackpotAlarmID = (try? c.decodeIfPresent(String.self, forKey: .lastJackpotAlarmID))
         lastJackpotAt = (try? c.decodeIfPresent(Date.self, forKey: .lastJackpotAt))
         openFromAlarmAt = (try? c.decodeIfPresent(Date.self, forKey: .openFromAlarmAt))
+        autoPlayOnOpen = (try? c.decodeIfPresent(Bool.self, forKey: .autoPlayOnOpen)) ?? d.autoPlayOnOpen
+        pendingBGMAt = (try? c.decodeIfPresent(Date.self, forKey: .pendingBGMAt))
+        fanfareMode = (try? c.decodeIfPresent(FanfareMode.self, forKey: .fanfareMode)) ?? d.fanfareMode
+        fanfareSound = (try? c.decodeIfPresent(String.self, forKey: .fanfareSound)) ?? d.fanfareSound
         // 値の範囲チェック
         bgmVolume = min(1, max(0, bgmVolume))
         bgmDelayMs = min(5000, max(0, bgmDelayMs))
@@ -97,6 +127,17 @@ enum SettingsStore {
         var s = loadUnlocked()
         body(&s)
         saveUnlocked(s)
+    }
+
+    /// 「アプリが前面になったらBGMを鳴らす」依頼が10分以内にあれば、消して true を返す。
+    /// 画面側とIntent側の両方から呼んでも、1回だけ true になる。
+    static func consumePendingBGM() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        var s = loadUnlocked()
+        guard let at = s.pendingBGMAt else { return false }
+        s.pendingBGMAt = nil
+        saveUnlocked(s)
+        return Date().timeIntervalSince(at) < 600
     }
 
     private static func loadUnlocked() -> AppSettings {
