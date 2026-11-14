@@ -1,0 +1,73 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      xcode_path:
+        description: "使うXcodeのパス(空欄ならランナーの既定)。例: /Applications/Xcode_26.4.1.app"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          echo "== インストール済みXcode =="
+          ls -d /Applications/Xcode*.app || true
+          if [ -n "${{ github.event.inputs.xcode_path }}" ]; then
+            sudo xcode-select -s "${{ github.event.inputs.xcode_path }}"
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project PachiAlarm.xcodeproj \
+            -scheme PachiAlarm \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build.log
+
+      - name: Package IPA
+        run: |
+          APP="build/Build/Products/Release-iphoneos/PachiAlarm.app"
+          test -d "$APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry PachiAlarm-unsigned.ipa Payload
+          ls -la PachiAlarm-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PachiAlarm-unsigned-ipa
+          path: PachiAlarm-unsigned.ipa
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
