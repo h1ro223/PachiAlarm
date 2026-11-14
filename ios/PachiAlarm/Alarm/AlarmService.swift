@@ -20,6 +20,18 @@ enum SecondaryChoice: String, CaseIterable, Identifiable {
     }
 }
 
+/// 停止ボタンの動作。ロック中の停止ではBGMを鳴らせなかったので、アプリを前面に開く版も試す。
+enum StopMode: String, CaseIterable, Identifiable {
+    case normal, openApp
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .normal: return "通常(裏で処理)"
+        case .openApp: return "アプリを開く(解除が必要)"
+        }
+    }
+}
+
 /// アラーム音の選択
 enum SoundChoice: Hashable {
     case systemDefault
@@ -40,6 +52,10 @@ struct TestAlarmRequest {
     var sound: SoundChoice
     var secondary: SecondaryChoice
     var snoozeSeconds: Int
+    /// 停止ボタンの動作(通常 / アプリを開く)
+    var stopMode: StopMode = .normal
+    /// true ならAlarmKitのカウントダウン(タイマー)方式。fireDateとの差の秒数で鳴る。短い秒数のテスト用。
+    var useCountdown: Bool = false
 }
 
 struct AlarmRow: Identifiable {
@@ -150,6 +166,10 @@ final class AlarmService: ObservableObject {
         var countdownDuration: Alarm.CountdownDuration? = nil
         let presentation: AlarmPresentation
         var secondaryIntent: (any LiveActivityIntent)? = nil
+        // カウントダウン(タイマー)方式のときの待ち秒数。最低1秒。
+        let timerSeconds = max(1, req.fireDate.timeIntervalSinceNow)
+        // カウントダウン方式では、カウントダウン中の表示も必要になる
+        let timerUI = AlarmPresentation.Countdown(title: "カウントダウン中", pauseButton: nil)
 
         switch req.secondary {
         case .none:
@@ -157,7 +177,9 @@ final class AlarmService: ObservableObject {
                                             stopButton: stopButton,
                                             secondaryButton: nil,
                                             secondaryButtonBehavior: nil)
-            presentation = AlarmPresentation(alert: alert)
+            presentation = req.useCountdown
+                ? AlarmPresentation(alert: alert, countdown: timerUI)
+                : AlarmPresentation(alert: alert)
         case .snooze:
             let snooze = AlarmButton(text: "スヌーズ", textColor: .white, systemImageName: "zzz")
             alert = AlarmPresentation.Alert(title: LocalizedStringResource(stringLiteral: req.title),
@@ -174,7 +196,9 @@ final class AlarmService: ObservableObject {
                                             stopButton: stopButton,
                                             secondaryButton: open,
                                             secondaryButtonBehavior: .custom)
-            presentation = AlarmPresentation(alert: alert)
+            presentation = req.useCountdown
+                ? AlarmPresentation(alert: alert, countdown: timerUI)
+                : AlarmPresentation(alert: alert)
             secondaryIntent = PachiOpenAppIntent(alarmID: id.uuidString)
         }
 
@@ -182,10 +206,22 @@ final class AlarmService: ObservableObject {
                                                         metadata: PachiMetadata(),
                                                         tintColor: Color(red: 1.0, green: 0.78, blue: 0.2))
 
-        let schedule: Alarm.Schedule
+        // カウントダウン方式: 待ち秒数(preAlert)で鳴らす。日時スケジュールは付けない。
+        if req.useCountdown {
+            countdownDuration = Alarm.CountdownDuration(
+                preAlert: timerSeconds,
+                postAlert: req.secondary == .snooze ? TimeInterval(req.snoozeSeconds) : nil)
+        }
+
+        let schedule: Alarm.Schedule?
         let comps = Calendar.current.dateComponents([.hour, .minute], from: req.fireDate)
         let fireText: String
-        if req.repeatsDaily {
+        if req.useCountdown {
+            schedule = nil
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm:ss"
+            fireText = "タイマー \(Int(timerSeconds.rounded()))秒(\(f.string(from: req.fireDate))ごろ)"
+        } else if req.repeatsDaily {
             let time = Alarm.Schedule.Relative.Time(hour: comps.hour ?? 7, minute: comps.minute ?? 0)
             let everyday: [Locale.Weekday] = [.sunday, .monday, .tuesday, .wednesday, .thursday, .friday, .saturday]
             schedule = .relative(Alarm.Schedule.Relative(time: time, repeats: .weekly(everyday)))
@@ -203,11 +239,19 @@ final class AlarmService: ObservableObject {
         case .named(let name): sound = .named(name)
         }
 
+        // 停止ボタンのIntent(通常=裏で処理 / アプリを開く)
+        let stopIntent: any LiveActivityIntent
+        if req.stopMode == .openApp {
+            stopIntent = PachiStopOpenIntent(alarmID: id.uuidString)
+        } else {
+            stopIntent = PachiStopIntent(alarmID: id.uuidString)
+        }
+
         let config = AlarmManager.AlarmConfiguration<PachiMetadata>(
             countdownDuration: countdownDuration,
             schedule: schedule,
             attributes: attributes,
-            stopIntent: PachiStopIntent(alarmID: id.uuidString),
+            stopIntent: stopIntent,
             secondaryIntent: secondaryIntent,
             sound: sound)
 
@@ -220,7 +264,7 @@ final class AlarmService: ObservableObject {
                                                         soundLabel: req.sound.label,
                                                         secondaryLabel: secondaryText, createdAt: Date())
             }
-            DebugLog.shared.log("ALARM", "登録OK \(id.uuidString.prefix(8)) \(fireText) 音=\(req.sound.label) 副ボタン=\(secondaryText)")
+            DebugLog.shared.log("ALARM", "登録OK \(id.uuidString.prefix(8)) \(fireText) 音=\(req.sound.label) 副ボタン=\(secondaryText) 停止=\(req.stopMode.label)")
             reload(source: "登録直後")
             return true
         } catch {
@@ -233,7 +277,7 @@ final class AlarmService: ObservableObject {
 
     func cancel(_ id: UUID) async {
         do {
-            try await AlarmManager.shared.cancel(id: id)
+            try AlarmManager.shared.cancel(id: id)
             DebugLog.shared.log("ALARM", "取消 \(id.uuidString.prefix(8))")
         } catch {
             DebugLog.shared.log("ALARM", "取消失敗: \(error.localizedDescription)")
