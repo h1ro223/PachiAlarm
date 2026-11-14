@@ -1,0 +1,15 @@
+# XcodeGenで生成されるもの
+PachiAlarm.xcodeproj/
+build/
+Payload/
+*.ipa
+build.log
+DerivedData/
+
+# 著作権のある本物の音源・映像はリポジトリに入れない(アプリ内の取り込み機能で入れる)
+private/
+*.private.mp3
+
+# OS
+.DS_Store
+Thumbs.db
