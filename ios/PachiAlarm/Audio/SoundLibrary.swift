@@ -96,6 +96,17 @@ enum SoundLibrary {
         return Bundle.main.url(forResource: bundledBGMName, withExtension: nil)
     }
 
+    /// ファンファーレ音の名前から実ファイルを探す。取り込んだ音(Library/Sounds) → 同梱の順。
+    /// 名前が空なら同梱の dummy_alarm_20s.caf を使う。
+    static func resolveFanfare(_ name: String) -> URL? {
+        let target = name.isEmpty ? "dummy_alarm_20s.caf" : name
+        let lib = librarySoundsDir.appendingPathComponent(target)
+        if FileManager.default.fileExists(atPath: lib.path) { return lib }
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent(target),
+           FileManager.default.fileExists(atPath: bundled.path) { return bundled }
+        return nil
+    }
+
     static func duration(of url: URL) -> Double? {
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
         let rate = file.processingFormat.sampleRate
